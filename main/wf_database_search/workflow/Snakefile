@@ -111,16 +111,16 @@ rule construct_database:
 #manifest file - a list of immunopeptidomics files to process
 rule run_Fragpipe:
     input:
-        database_for_msfragger = "_data/personalized/{project}/final_msfragger_database.{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}.fasta",
+        database_for_msfragger = "_data/{project}/final_msfragger_database.{project}.{translation_mode}.fasta",
         immunopeptidomics_data = lambda wildcards: get_dataset(wildcards.project).immunopeptidomics_data,
         workflow_template = "workflow/shell/wf_personalized_antigenes/template.workflow"
     output:
-        workflow = "_data/personalized/{project}/{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}.workflow",
-        psm_tsv = "_data/personalized/{project}/fragpipe_workdir.{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}/{project}/psm.tsv"
+        workflow = "_data/{project}/{project}.{translation_mode}.workflow",
+        psm_tsv = "_data/{project}/fragpipe_workdir.{project}.{translation_mode}/{project}/psm.tsv"
     params:
         project = lambda wildcards: wildcards.project,
         fdr = lambda wildcards: get_dataset(wildcards.project).fdr_for_ip,
-        fragpipe_workdir = "_data/personalized/{project}/fragpipe_workdir.{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}"
+        fragpipe_workdir = "_data/{project}/fragpipe_workdir.{project}.{translation_mode}"
     threads: 
         40
     resources:
@@ -142,20 +142,20 @@ rule run_Fragpipe:
 #run MHC binding prediction
 rule run_netMHCpan:
     input:
-        psm_tsv = "_data/personalized/{project}/fragpipe_workdir.{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}/{project}/psm.tsv",
+        psm_tsv = "_data/{project}/fragpipe_workdir.{project}.{translation_mode}/{project}/psm.tsv",
         hlas = lambda wildcards: "_data/hla_typing/{project}/{project}_hlas.txt" if get_dataset(wildcards.project).run_hla_typing else get_dataset(wildcards.project).hla_txt
     output:
-        xls = "_data/personalized/{project}/fragpipe_postprocessing/{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}.NetMHCpan_out.xls"
+        xls = "_data/{project}/fragpipe_postprocessing/{project}.{translation_mode}.NetMHCpan_out.xls"
     params:
         project = lambda wildcards: wildcards.project
     singularity: 
         "workflow/containers/image/netmhcpan.4.1.ubuntu.sif"
     shell:
         '''
-        mkdir -p _data/personalized/{params.project}/fragpipe_postprocessing
+        mkdir -p _data/{params.project}/fragpipe_postprocessing
         hlas_line=$(<{input.hlas})
-        /usr/bin/python3.6 ./workflow/shell/wf_personalized_antigenes/create_pep_file.py --input {input.psm_tsv} --output _data/personalized/{params.project}/fragpipe_postprocessing/{params.project}.pep
-        /usr/local/bin/netMHCpan-4.1/netMHCpan -a $hlas_line -p _data/personalized/{params.project}/fragpipe_postprocessing/{params.project}.pep -xls -xlsfile {output.xls} > /dev/null
+        /usr/bin/python3.6 ./workflow/shell/wf_personalized_antigenes/create_pep_file.py --input {input.psm_tsv} --output _data/{params.project}/fragpipe_postprocessing/{params.project}.pep
+        /usr/local/bin/netMHCpan-4.1/netMHCpan -a $hlas_line -p _data/{params.project}/fragpipe_postprocessing/{params.project}.pep -xls -xlsfile {output.xls} > /dev/null
         '''
     
 #perform filtering and postprocessing. Create figures
