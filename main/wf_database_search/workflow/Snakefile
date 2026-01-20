@@ -1,0 +1,201 @@
+include: "../../include_hla_typing/Snakefile"
+
+assert "MAX_RAM_MB" in config, "'MAX_RAM_MB' not in config"
+MAX_RAM_MB = config["MAX_RAM_MB"]
+
+# reset the DATASETS list to []
+DATABASE_SEARCHES = []
+
+wildcard_constraints:
+    translation_mode = "start_to_stop|stop_to_stop",
+
+
+class DatabaseSearch():
+    def __init__(
+                    self,
+                    project,
+                    samples=None,
+                    extra_fasta,
+                    translation_modes=['start_to_stop'],
+                    immunopeptidomics_data,
+                    run_hla_typing=False,
+                    hla_txt=None,
+                    fdr_for_ip=0.01
+                ):
+        self.project = project
+        self.samples = samples
+        self.extra_fasta = extra_fasta
+        self.translation_modes = translation_modes
+        self.immunopeptidomics_data = immunopeptidomics_data
+        self.run_hla_typing = run_hla_typing
+        self.hla_txt = hla_txt
+        self.fdr_for_ip = fdr_for_ip
+        if self.run_hla_typing and self.hla_txt is None:
+            HLA_TYPINGS.append(HLA_typing(self.project, self.samples, paired_end=self.paired_end))
+        elif not(self.run_hla_typing) and self.hla_txt is None:
+            raise ValueError("You need to set run_hla_typing to True or provide an hla_txt file")
+
+if "todo" in config and "current_pipeline" in config and config['current_pipeline']=='wf_database_search':
+    include: f"profiles/{config['todo']}/todo.py"
+
+
+rule all:
+    input:
+        database_for_msfragger = [f"_data/{database_search.project}/final_msfragger_database.{database_search.project}.{translation_mode}.fasta" for database_search in DATABASE_SEARCHES for translation_mode in database_search.translation_modes],
+        psm_tsv = [f"_data/{database_search.project}/fragpipe_workdir.{database_search.project}.{translation_mode}/{database_search.project}/psm.tsv" for database_search in DATABASE_SEARCHES for translation_mode in database_search.translation_modes],
+        #tsv = [f"_data/hla_typing/{hla_typing.project}/{hla_typing.project}.genotype.tsv" for hla_typing in HLA_TYPINGS],
+        #txt = [f"_data/hla_typing/{hla_typing.project}/{hla_typing.project}.hlas.txt" for hla_typing in HLA_TYPINGS],
+        xls = [f"_data/{database_search.project}/fragpipe_postprocessing/{database_search.project}.{translation_mode}.NetMHCpan_out.xls" for database_search in DATABASE_SEARCHES for translation_mode in database_search.translation_modes],
+        csv = [f"_data/{database_search.project}/fragpipe_postprocessing/Summary.{database_search.project}.{translation_mode}.csv" for database_search in DATABASE_SEARCHES for translation_mode in database_search.translation_modes]
+
+
+#This rule translates the merged dna sequence fasta to protein using chosen translation mode option. 
+#Start to stop in this case is starting from AUG and alternative start codons and stoping and the stop codon or in the end of the dna sequence  
+rule translate:
+    input:
+        extra_fasta = lambda wildcards: wildcards.extra_fasta,
+    output:
+        aminoacid_fasta = temp("_data/{project}/{project}.{translation_mode}.aminoacid.fasta")
+    params:
+        translation_mode = lambda wildcards: 1 if wildcards.translation_mode=='start_to_stop' else 2 
+    shell:
+        '''
+        time ./shell/ORFfinder -in {input.extra_fasta} -out {output.aminoacid_fasta} -s {params.translation_mode} -ml 30 -strand plus
+        '''
+
+#This rule is to add PE=2 to the neotranscript database and add the _NEOTRANSCRIPT tag to facilitate peptide class assignment in the Frapipe results downstream analysis
+#PE stands for protein evidence. In this pipeline we assign PE=1 to the uniprot proteins in _data/uniprot and PE=2 to the neotranscript proteins.
+#This is done to then use group FDR calculation in Fragpipe with group tag being protein evidence from fasta file
+#This way FDR is estimated separately for canonical and non-canonical peptides. This is more stringent, but ensures there is no FDR underestimation 
+rule add_PE:
+    input:
+        aminoacid_fasta = "_data/{project}/{project}.{translation_mode}.aminoacid.fasta"
+    output:
+        aminoacid_fasta_PE_changed = temp("_data/{project}/{project}.{translation_mode}.aminoacid_PEchanged.fasta")
+    singularity: 
+        "workflow/containers/image/python.3.12.2.debian.sif"
+    shell:
+        '''
+        python ./workflow/shell/wf_personalized_antigenes/add_PE.py --input {input.aminoacid_fasta} --output {output.aminoacid_fasta_PE_changed} --verbose
+        '''
+
+#this rule concatenates uniprot and the neotranscript database, adds decoys and common contaminants
+rule construct_database:
+    input:
+        aminoacid_fasta_PE_changed = "_data/{project}/{project}.{translation_mode}.aminoacid_PEchanged.fasta",
+        uniprot = "_data/uniprot/uniprotkb_with_isoforms_reviewed_true_AND_model_organ_2024_10_29_PE_changed.fasta"
+    output:
+        database_for_msfragger = "_data/{project}/final_msfragger_database.{project}.{translation_mode}.fasta"
+    params:
+        project = lambda wildcards: wildcards.project
+    singularity:
+        "workflow/containers/image/fragpipe.22.0.ubuntu.sif"
+    group: 
+        "fragpipe_steps"
+    shell:
+        '''
+        work_dir=$(pwd)
+        mkdir ./_data/{params.project}/tmp
+        cd ./_data/{params.project}/tmp
+        /fragpipe_bin/fragPipe-22.0/fragpipe/tools/Philosopher/philosopher-v5.1.1 workspace --init
+        /fragpipe_bin/fragPipe-22.0/fragpipe/tools/Philosopher/philosopher-v5.1.1 database --custom $work_dir/{input.aminoacid_fasta_PE_changed} --add $work_dir/{input.uniprot} --contam
+        cd $work_dir
+        mv ./_data/{params.project}/tmp/*.fasta.fas {output.database_for_msfragger}
+        rm -r ./_data/{params.project}/tmp
+        '''
+
+#this rule runs Fragpipe. To run Fragpipe make sure that Fragpipe dependensies are found in the shell folder
+#for Fragpipe 22.0 the dependencies are: MSFragger-4.1, IonQuant-1.10.27, diaTracer-1.1.5. Dowload and unzip them to the shell folder.
+#fragpipe inputs:
+#workflow file - essentially a config file with all the settings. Here it's created from a template file and modified for the input database
+#manifest file - a list of immunopeptidomics files to process
+rule run_Fragpipe:
+    input:
+        database_for_msfragger = "_data/personalized/{project}/final_msfragger_database.{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}.fasta",
+        immunopeptidomics_data = lambda wildcards: get_dataset(wildcards.project).immunopeptidomics_data,
+        workflow_template = "workflow/shell/wf_personalized_antigenes/template.workflow"
+    output:
+        workflow = "_data/personalized/{project}/{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}.workflow",
+        psm_tsv = "_data/personalized/{project}/fragpipe_workdir.{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}/{project}/psm.tsv"
+    params:
+        project = lambda wildcards: wildcards.project,
+        fdr = lambda wildcards: get_dataset(wildcards.project).fdr_for_ip,
+        fragpipe_workdir = "_data/personalized/{project}/fragpipe_workdir.{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}"
+    threads: 
+        40
+    resources:
+        mem_mb  = lambda wildcards, attempt, input, threads: min(MAX_RAM_MB, get_size_mb(input.database_for_msfragger)*20* threads * attempt**2)
+    singularity:
+        "workflow/containers/image/fragpipe.22.0.ubuntu.sif"
+    group: 
+        "fragpipe_steps"
+    shell:
+        '''
+        ls {input.immunopeptidomics_data}
+        mkdir -p {params.fragpipe_workdir}
+        sed -e "s|^database.db-path=.*|database.db-path={input.database_for_msfragger}|" -e "s|^phi-report.filter=.*|phi-report.filter=--sequential --prot 1 --group --pep {params.fdr}|" "{input.workflow_template}" > "{output.workflow}"
+        ls {input.immunopeptidomics_data} | awk -v proj="{params.project}" -v ipd="{input.immunopeptidomics_data}" '{{print ipd "/" $0 "\t" proj "\t\tDDA"}}' > "_data/personalized/{params.project}/{params.project}.manifest"
+        time /fragpipe_bin/fragPipe-22.0/fragpipe/bin/fragpipe --headless --config-tools-folder workflow/shell/wf_personalized_antigenes \
+        --workflow {output.workflow} --manifest "_data/personalized/{params.project}/{params.project}.manifest" --workdir {params.fragpipe_workdir} > /dev/null
+        '''
+
+#run MHC binding prediction
+rule run_netMHCpan:
+    input:
+        psm_tsv = "_data/personalized/{project}/fragpipe_workdir.{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}/{project}/psm.tsv",
+        hlas = lambda wildcards: "_data/hla_typing/{project}/{project}_hlas.txt" if get_dataset(wildcards.project).run_hla_typing else get_dataset(wildcards.project).hla_txt
+    output:
+        xls = "_data/personalized/{project}/fragpipe_postprocessing/{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}.NetMHCpan_out.xls"
+    params:
+        project = lambda wildcards: wildcards.project
+    singularity: 
+        "workflow/containers/image/netmhcpan.4.1.ubuntu.sif"
+    shell:
+        '''
+        mkdir -p _data/personalized/{params.project}/fragpipe_postprocessing
+        hlas_line=$(<{input.hlas})
+        /usr/bin/python3.6 ./workflow/shell/wf_personalized_antigenes/create_pep_file.py --input {input.psm_tsv} --output _data/personalized/{params.project}/fragpipe_postprocessing/{params.project}.pep
+        /usr/local/bin/netMHCpan-4.1/netMHCpan -a $hlas_line -p _data/personalized/{params.project}/fragpipe_postprocessing/{params.project}.pep -xls -xlsfile {output.xls} > /dev/null
+        '''
+    
+#perform filtering and postprocessing. Create figures
+rule fp_output_postprocessing:
+    input:
+        psm_tsv = "_data/personalized/{project}/fragpipe_workdir.{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}/{project}/psm.tsv",
+        hlas = lambda wildcards: "_data/hla_typing/{project}/{project}_hlas.txt" if get_dataset(wildcards.project).run_hla_typing else get_dataset(wildcards.project).hla_txt,
+        xls = "_data/personalized/{project}/fragpipe_postprocessing/{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}.NetMHCpan_out.xls",
+        hla_la_cryptic = "_data/HLA_ligand_atlas/HLA_la_reported_cryptic_peptides.csv"
+    output:
+        csv = "_data/personalized/{project}/fragpipe_postprocessing/Summary.{project}_{method}.{filtering_method}.groupby_{group}.{translation_mode}.csv"
+    params:
+        project = lambda wildcards: wildcards.project,
+        fdr = lambda wildcards: get_dataset(wildcards.project).fdr_for_ip,
+        output_folder = lambda wildcards: f"_data/personalized/{wildcards.project}/fragpipe_postprocessing/",
+        translation_mode = lambda wildcards: wildcards.translation_mode,
+        filtering_method = lambda wildcards: wildcards.filtering_method,
+        group = lambda wildcards: wildcards.group,
+        method = lambda wildcards: wildcards.method
+    singularity:
+        "workflow/containers/image/python.3.12.2.debian.sif"
+    shell:
+        '''
+        hlas_line=$(<{input.hlas})
+        python ./workflow/shell/wf_personalized_antigenes/fp_output_post_processing.py --input_tsv {input.psm_tsv} --input_xls {input.xls} --sample {params.project} --hla $hlas_line \
+        --output_dir {params.output_folder} --search_engine Fragpipe --fdr {params.fdr} --translation_mode {params.translation_mode} --filtering_method {params.filtering_method} \
+        --group {params.group} --method {params.method} --hla_la_cryptic {input.hla_la_cryptic} > /dev/null
+        '''
+
+    
+
+
+# rule have_fun:
+#               __________ 
+#              |          |
+#              | ~@**#~~  |
+#        ,,,   |  ________|
+#      (O___0) \/  
+#   \    | |    /
+#    \ \     \ /
+#      /     /
+#      |     |
+
